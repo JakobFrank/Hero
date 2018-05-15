@@ -1,11 +1,12 @@
 // hero.cpp : Defines the entry point for the console application.
 //
 
-#include "../date/date.h"
+#include "../date/include/date/date.h"
 #include "../PicoSHA2/picosha2.h"
 #include "crossplatform.h"
 #include "Utils.h"
 #include "hero.h"
+#include "classes/indexmap.h"
 
 #include <iostream>
 #include <cstdint>
@@ -133,6 +134,40 @@ int main(int argc, char* argv[]) {
 			usage(argv[0], Command::init);
 		}
 	}
+	else if (!strcmp(argv[1], "repofix")) {
+		// Skip all the mode stuff, just run hero-repofix
+		// I'm making this available, but at least for now not publicly documenting it
+		std::string arguments("hero-repofix");
+		// Go through the arguments we got after repofix, adding them to the string, so we can call repofix correctly
+		// At least for now, this is pretty much useless, since repofix can only be fixed with exactly one argument
+		// But I don't think I'll be touching this again, so...
+		// I intend to write this so that I'll never need to.
+		for (int i = 2; i < argc; ++i) {
+			arguments += " ";
+			arguments += argv[i];
+		}
+		// You'd think that arguments would now have our commandline.
+		// You'd be right, but only if hero-repofix is in the PATH.
+		// In order to handle that, we're going to assume that hero and hero-repofix are in the same directory
+		// So we can take the path given in argv[0] and prepend it to the produced commandline to make sure we're calling repofix.
+		std::string invocation(argv[0]);
+		size_t index(invocation.find_last_of('/'));
+		if (index == std::string::npos) {
+			index = invocation.find_last_of('\\');
+			if (index == std::string::npos) {
+				std::cerr << "Could not invoke hero-repofix.\n";
+				exit(127);
+			}
+		}
+		invocation = invocation.substr(0, index+1);
+		if (system(appended(invocation, arguments))) {
+			std::cerr << "Could not invoke hero-repofix.\n";
+			exit(128);
+		}
+		else {
+			exit(0);
+		}
+	}
 	else {
 		usage(argv[0], Command::unknownCommand);
 	}
@@ -203,9 +238,11 @@ int main(int argc, char* argv[]) {
 // First, the easiest and always-run command: init.
 // Initialize all the files the other commands assume to exist.
 void init() {
-	mkdir(".vcs");
-	mkdir(".vcs/index");
-	mkdir(".vcs/commits");
+	mkdir(REPOSITORY_PATH.c_str());
+	mkdir(repositoryPath("index"));
+	mkdir(repositoryPath("commits"));
+
+	std::ofstream indexmap(INDEXMAP_PATH);
 
 	// Make a plain initial commit marking repository creation
 	// First, the easy part.
@@ -241,9 +278,9 @@ void init() {
 	std::string hash = picosha2::hash256_hex_string(contents);
 
 	// And write to the commit file
-	std::ofstream file(".vcs/commits/" + hash);
+	std::ofstream file(repositoryPath("commits/" + hash));
 	if (!file) {
-		removeDirectory(".vcs");
+		removeDirectory(REPOSITORY_PATH);
 		std::cerr << "Could not initialize repository.\n";
 		exit(1);
 	}
@@ -251,9 +288,9 @@ void init() {
 	file.close();
 
 	// Write the HEAD marker
-	std::ofstream head(".vcs/HEAD");
+	std::ofstream head(repositoryPath("HEAD"));
 	if (!head) {
-		removeDirectory(".vcs");
+		removeDirectory(REPOSITORY_PATH);
 		std::cerr << "Could not initialize repository.\n";
 		exit(1);
 	}
@@ -265,20 +302,58 @@ void init() {
 
 // Next up, add.
 // Take the files in the provided vector, and copy them to the index
-void add(const std::vector<std::string>& files) {
+void addFiles(const std::vector<std::string>& files, Indexmap& imap) {
 	std::string tmp;
+	std::string hash;
 	for (auto file : files) {
-		tmp = ".vcs/index/" + file;
-		if (!copyfile(file.c_str(), tmp.c_str())) {
-			std::cout << "Error: Could not copy file " << file << ".\n";
+		std::ifstream read(file);
+		if (!read) {
+			// If a provided file is not a file, then try to treat it as a directory
+			std::vector<std::string> f;
+			if (contentsOfDirectory(file, f)) {
+				std::cerr << "Error: Could not index file " << file << ".\n";
 
-			emptyDirectory(".vcs/index");
-			std::cout << "Index emptied.\n";
-			std::cout << "Please re-add the appropriate files to the index.\n";
+				emptyDirectory(repositoryPath("index"));
+				std::cerr << "Index emptied.\n";
+				std::cerr << "Please re-add the appropriate files to the index.\n";
+
+				exit(2);
+			}
+
+			// Add all files in the directory.
+			// First, make sure that the paths get prepended to the filenames
+			// Then recurse with the newly filled vector.
+			if (file.back() != '/' && file.back() != '\\')
+				file += '/';
+			for (auto& fi : f) {
+				fi = file + fi;
+			}
+			addFiles(f, imap);
+			continue;
+		}
+
+		hash = picosha2::hash256_hex_string(read);
+		read.close();
+		imap[file] = hash;
+		tmp = repositoryPath("index/" + hash);
+		if (!copyfile(file.c_str(), tmp.c_str())) {
+			std::cerr << "Error: Could not copy file " << file << ".\n";
+
+			emptyDirectory(repositoryPath("index"));
+			std::cerr << "Index emptied.\n";
+			std::cerr << "Please re-add the appropriate files to the index.\n";
 
 			exit(1);
 		}
 	}
+}
+
+// Master command for addFiles - Set up the Indexmap, and print out a success message.
+void add(const std::vector<std::string>& files) {
+	IndexmapLoader imap_ldr;
+	Indexmap& imap(imap_ldr.map);
+
+	addFiles(files, imap);
 
 	std::cout << "All files added to index.\n";
 }
@@ -294,7 +369,7 @@ void commit() {
 	}
 
 	// Check for the commit lock
-	if (std::ifstream lock = std::ifstream(".vcs/COMMIT_LOCK", std::ios::binary)) {
+	if (std::ifstream lock = std::ifstream(repositoryPath("COMMIT_LOCK"), std::ios::binary)) {
 		// Committing is locked: We should issue a warning 
 		detached = true;
 
@@ -335,6 +410,13 @@ void commit() {
 	// Get commit title from the user and write, escaped, to commit
 	std::cout << "Commit title: ";
 	std::getline(std::cin, title);
+
+	// Ken's Easter Egg
+	// This conditional is dedicated to Ken Ellorando.
+	if (title == "F") {
+		std::cout << "Respects paid.\n";
+	}
+
 	title = escaped(title, "/", "/sl;");
 	commit << "title " << escaped(title, "&", "/amp;") << "\n";
 
@@ -350,14 +432,12 @@ void commit() {
 	std::cout << "Creating new commit \'" << title << "\'..." << std::endl;
 
 	// Now, get the list of files in the index, and add their names to the commit header.
-	std::vector<std::string> files;
-	if (int err = filesInDirectory(".vcs/index", files)) {
-		std::cerr << "Could not list index.\n";
-		exit(err);
-	}
+	CommitmapLoader cmap_ldr;
+	Commitmap& cmap(cmap_ldr.map);
+
 	commit << "files [";
-	for (const auto& file : files) {
-		commit << file << ",";
+	for (const auto& pair : cmap) {
+		commit << pair.second << ",";
 	}
 	commit << "]\n";
 
@@ -366,15 +446,28 @@ void commit() {
 
 	// Now, loop over the files
 	size_t totalSize(0); // Tracks the size of all files, for the footer.
-	for (const auto& file : files) {
-		// First, write the file path. For now, we don't properly handle subdirectories, so that's just a filename.
-		commit << file << "\n";
+	for (const auto& pair : cmap) {
+		const Commitmap::Hash& index(pair.first);
+		const Commitmap::Filename& disk(pair.second);
+
+		// First, write the file path, from the commitmap.
+		commit << disk << "\n";
 
 		// Now, open the file
-		std::ifstream ifs(".vcs/index/" + file, std::ios::binary);
+		std::ifstream ifs(repositoryPath("index/" + index), std::ios::binary);
 
-		// Now, calculate and write the SHA256 of that file
-		commit << "checksum " << picosha2::hash256_hex_string(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>()) << "\n";
+		// Now, write the hash of the file.
+		// We distrust the indexmap, just in case it's been modified (for some reason):
+		//   We want the commit's file hash to always match the hash of the data in the file.
+		// It's a data integrity thing. That is, after all, the point of writing the hash.
+		auto hash = picosha2::hash256_hex_string(ifs);
+		if (hash != index) {
+			std::cout << "Indexed file " << disk << " has a hash mismatch.\n"
+				<< "  Hash at add time was: " << index << "\n"
+				<< "  Hash at commit time is: " << hash << "\n"
+				<< "Some data may have been corrupted.\n\n";
+		}
+		commit << "checksum " << hash << "\n";
 
 		// Now, get and write the size of the file
 		ifs.seekg(0, ifs.end);
@@ -396,13 +489,13 @@ void commit() {
 		commit << "&&&&&\n";
 
 		// Remove the file from the index
-		remove((".vcs/index/" + file).c_str());
+		remove(repositoryPath("index/" + index));
 	}
 
 	// Finally, the commit footer
 	commit << "COMMIT FOOTER\n";
 	commit << "&&&\n";
-	commit << "count " << files.size() << "\n";
+	commit << "count " << cmap.size() << "\n";
 	commit << "size " << totalSize << "\n";
 	commit << "&&&&&\n";
 
@@ -412,13 +505,16 @@ void commit() {
 	std::string hash = picosha2::hash256_hex_string(contents);
 
 	// And write to the commit file
-	std::ofstream file(".vcs/commits/" + hash, std::ios::binary);
+	std::ofstream file(repositoryPath("commits/" + hash), std::ios::binary);
 	if (!file) {
 		std::cerr << "Could not create commit.\n";
 		exit(1);
 	}
 	file.write(contents.c_str(), contents.size());
 	file.close();
+
+	// Now, clear the indexmap (the file on disk will be truncated at end-of-scope)
+	cmap.clear();
 
 	// If we're in a detached state, warn about not updating HEAD and print our hash
 	if (detached) {
@@ -428,9 +524,9 @@ void commit() {
 	}
 	// Else, update the HEAD marker to match this commit
 	else {
-		std::ofstream head(".vcs/HEAD", std::ios::trunc);
+		std::ofstream head(repositoryPath("HEAD"), std::ios::trunc);
 		if (!head) {
-			remove((".vcs/commits/" + hash).c_str());
+			remove(repositoryPath("commits/" + hash));
 			std::cerr << "Could not create commit.\n";
 			exit(2);
 		}
@@ -438,7 +534,7 @@ void commit() {
 		head.close();
 	}
 
-	emptyDirectory(".vcs/index");
+	emptyDirectory(repositoryPath("index"));
 
 	// Confirm to the user that we succeeded
 	std::cout << "Done.\n";
@@ -449,7 +545,7 @@ void commit() {
 // Passes that vector into add, and then calls commit
 void commitLast() {
 	std::string line(getHeadHash());
-	std::ifstream last(".vcs/commits/"+line);
+	std::ifstream last(repositoryPath("commits/"+line));
 	if (!last) {
 		std::cerr << "Could not access last commit.\n";
 		exit(1);
@@ -483,19 +579,27 @@ void commitLast() {
 // Has the semantics that all files listed are committed, and no other
 // The index is preserved as it was, except that files present in the index and command line are removed from the index
 void commitFiles(const std::vector<std::string>& files) {
-	removeDirectory(".vcs/indexCopy"); // Just in case
+	removeDirectory(repositoryPath("indexCopy")); // Just in case
 
 	// Back up the index
-	if (!copyDirectory(".vcs/index", ".vcs/indexCopy")) { 
+	if (!copyDirectory(repositoryPath("index"), repositoryPath("indexCopy"))) { 
 		std::cerr << "Could not back up repository index.\n";
 		exit(1);
 	}
 
+	// If INDEXMAP_PATH doesn't start with index/, our prior copy didn't get it, so we have to do it ourselves.
+	if (INDEXMAP_PATH.find("index/")) {
+		if (!copyfile(repositoryPath(INDEXMAP_PATH), repositoryPath("indexCopy/" + INDEXMAP_PATH))) {
+			std::cerr << "Could not back up repository index.\n";
+			exit(1);
+		}
+	}
+
 	// Empty the index entirely
-	emptyDirectory(".vcs/index");
+	emptyDirectory(repositoryPath("index"));
 
 	for (const auto& file : files) {
-		remove((".vcs/indexCopy/"+file).c_str()); // Make sure the file to be committed is removed from the copied index
+		remove(repositoryPath("indexCopy/"+file)); // Make sure the file to be committed is removed from the copied index
 	}
 
 	// Add all commandline files
@@ -503,14 +607,14 @@ void commitFiles(const std::vector<std::string>& files) {
 	// And then commit.
 	commit();
 
-	removeDirectory(".vcs/index");
+	removeDirectory(repositoryPath("index"));
 	// Restore the index, minus duplicated files
-	if (!copyDirectory(".vcs/indexCopy", ".vcs/index")) {
+	if (!copyDirectory(repositoryPath("indexCopy"), repositoryPath("index"))) {
 		std::cerr << "Could not restore index.\n";
-		removeDirectory(".vcs/indexCopy");
-		if (mkdir(".vcs/index") && errno != EEXIST) {
+		removeDirectory(repositoryPath("indexCopy"));
+		if (mkdir(repositoryPath("index")) && errno != EEXIST) {
 			std::cerr << "Also could not create index directory.\n";
-			std::cerr << "Please ensure that the folder \".vcs\" directory is writable...\n";
+			std::cerr << "Please ensure that the \""+REPOSITORY_PATH+"\" directory is writable...\n";
 			std::cerr << "Then create a folder named \"index\" inside it before running \"add\" or \"commit\".\n";
 			exit(errno);
 		}
@@ -519,7 +623,15 @@ void commitFiles(const std::vector<std::string>& files) {
 			exit(2);
 		}
 	}
-	removeDirectory(".vcs/indexCopy");
+
+	// Restore the Indexmap if we backed it up separately
+	if (INDEXMAP_PATH.find("index/")) {
+		if (!copyfile(repositoryPath("indexCopy/" + INDEXMAP_PATH), repositoryPath(INDEXMAP_PATH))) {
+			std::cerr << "Could not restore index.\n";
+			exit(3);
+		}
+	}
+	removeDirectory(repositoryPath("indexCopy"));
 }
 
 // Produces a log of the commit history by the commit headers
@@ -528,7 +640,7 @@ void log() {
 	std::ifstream commit;
 
 	while (hash != "0") {
-		commit.open(".vcs/commits/" + hash);
+		commit.open(repositoryPath("commits/" + hash));
 		if (!commit) {
 			std::cerr << "Could not access commit " << hash << "\n";
 			exit(1);
@@ -580,11 +692,11 @@ void checkout(std::string reference) {
 
 	if (reference == "HEAD") {
 		reference = head;
-		remove(".vcs/COMMIT_LOCK"); // Delete the lock file
+		remove(repositoryPath("COMMIT_LOCK")); // Delete the lock file
 	}
 	else if (reference != head) {
 		// Create the lock file
-		std::ofstream lock(".vcs/COMMIT_LOCK", std::ios::binary);
+		std::ofstream lock(repositoryPath("COMMIT_LOCK"), std::ios::binary);
 		lock << reference << "\n";
 
 		// And issue a warning
@@ -592,10 +704,10 @@ void checkout(std::string reference) {
 		std::cerr << "Commits made in this state will be lost forever unless you remember their hash.\n\n";
 	}
 	else {
-		remove(".vcs/COMMIT_LOCK"); // Delete the lock file
+		remove(repositoryPath("COMMIT_LOCK")); // Delete the lock file
 	}
 
-	std::ifstream commit(".vcs/commits/"+reference, std::ios::binary);
+	std::ifstream commit(repositoryPath("commits/"+reference), std::ios::binary);
 	if (!commit) {
 		std::cerr << "Could not open commit " << reference << "\n";
 		exit(1);
@@ -639,7 +751,8 @@ void checkout(std::string reference) {
 				char result = '\0';
 				while (result != 'y' && result != 'n' && result != '\n') {
 					std::cout << "File on disk has same SHA256 as file in commit. Checkout anyway? (y/N) ";
-					char result = tolower(std::cin.get());
+					result = tolower(std::cin.get());
+					std::cin.ignore(1);
 					std::cout << std::endl;
 				}
 				skip = (result != 'n');
@@ -648,6 +761,23 @@ void checkout(std::string reference) {
 
 		// Unless skip is set, read the file in the commit out to disk
 		if (!skip) {
+			// If the filename includes a directory mark, we need to go through it and make sure the directory exists before performing checkout.
+			if (filename.find('/')!=std::string::npos || filename.find('\\') != std::string::npos) {
+				// Split the path into a list of directories
+				std::vector<std::string> parts;
+				if (filename.find("/"))
+					parts = split(filename, '/');
+				else
+					parts = split(filename, '\\');
+
+				// And then make all those directories (except the last one, which is a filename)
+				std::string path;
+				for (size_t i = 0; i < parts.size() - 1; ++i) {
+					path += parts[i] + '/';
+					mkdir(path.c_str());
+				}
+			}
+
 			std::fstream file(filename, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
 			if (!file) {
 				std::cerr << "Unable to open file " << filename << " for writing.\n";
